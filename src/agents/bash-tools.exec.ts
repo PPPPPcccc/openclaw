@@ -1,3 +1,4 @@
+import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 import type { AgentTool, AgentToolResult } from "@mariozechner/pi-agent-core";
@@ -75,6 +76,58 @@ function extractScriptTargetFromCommand(
   }
 
   return null;
+}
+
+function normalizeB3ParentSpanId(value?: string): string | undefined {
+  const normalized = value?.trim().toLowerCase();
+  return normalized && /^[0-9a-f]{16}$/.test(normalized) ? normalized : undefined;
+}
+
+function buildB3TraceHeadersWithParent(traceId: string, parentSpanId?: string): {
+  traceId: string;
+  spanId: string;
+  traceparent: string;
+} {
+  const normalizedTraceId = traceId.trim().toLowerCase();
+  const spanId = normalizeB3ParentSpanId(parentSpanId) ?? crypto.randomBytes(8).toString("hex");
+  const normalizedParentSpanId = normalizeB3ParentSpanId(parentSpanId);
+  return normalizedParentSpanId
+    ? {
+        traceId: normalizedTraceId,
+        spanId: normalizedParentSpanId,
+        traceparent: `00-${normalizedTraceId}-${normalizedParentSpanId}-01`,
+      }
+    : {
+    traceId: normalizedTraceId,
+    spanId,
+    traceparent: `00-${normalizedTraceId}-${spanId}-01`,
+      };
+}
+
+function maybeInjectTraceHeadersIntoCurlCommand(
+  command: string,
+  traceId?: string,
+  parentSpanId?: string,
+): string {
+  const normalizedTraceId = traceId?.trim().toLowerCase();
+  if (!normalizedTraceId || !/^[0-9a-f]{32}$/.test(normalizedTraceId)) {
+    return command;
+  }
+  const trimmed = command.trimStart();
+  if (!/^(?:sudo\s+)?curl(?:\s|$)/i.test(trimmed)) {
+    return command;
+  }
+  // Preserve explicit user-supplied tracing headers.
+  if (/(?:^|\s)-H\s+["'](?:x-b3-traceid|traceparent)\s*:/i.test(command)) {
+    return command;
+  }
+  const headers = buildB3TraceHeadersWithParent(normalizedTraceId, parentSpanId);
+  const headerArgs =
+    ` -H "x-b3-traceid: ${headers.traceId}"` +
+    ` -H "x-b3-spanid: ${headers.spanId}"` +
+    ` -H "x-b3-sampled: 1"` +
+    ` -H "traceparent: ${headers.traceparent}"`;
+  return command.replace(/\bcurl\b/i, (token) => `${token}${headerArgs}`);
 }
 
 async function validateScriptFileForShellBleed(params: {
@@ -225,6 +278,11 @@ export function createExecTool(
       if (!params.command) {
         throw new Error("Provide a command to start.");
       }
+      const command = maybeInjectTraceHeadersIntoCurlCommand(
+        params.command,
+        defaults?.b3TraceId,
+        defaults?.b3ParentSpanId,
+      );
 
       const maxOutput = DEFAULT_MAX_OUTPUT;
       const pendingMaxOutput = DEFAULT_PENDING_MAX_OUTPUT;
@@ -302,7 +360,7 @@ export function createExecTool(
         }
       }
       if (elevatedRequested) {
-        logInfo(`exec: elevated command ${truncateMiddle(params.command, 120)}`);
+        logInfo(`exec: elevated command ${truncateMiddle(command, 120)}`);
       }
       const configuredHost = defaults?.host ?? "sandbox";
       const sandboxHostConfigured = defaults?.host === "sandbox";
@@ -401,7 +459,7 @@ export function createExecTool(
 
       if (host === "node") {
         return executeNodeHostCommand({
-          command: params.command,
+          command,
           workdir,
           env,
           requestedEnv: params.env,
@@ -426,7 +484,7 @@ export function createExecTool(
 
       if (host === "gateway" && !bypassApprovals) {
         const gatewayResult = await processGatewayAllowlist({
-          command: params.command,
+          command,
           workdir,
           env,
           pty: params.pty === true && !sandbox,
@@ -467,10 +525,10 @@ export function createExecTool(
 
       // Preflight: catch a common model failure mode (shell syntax leaking into Python/JS sources)
       // before we execute and burn tokens in cron loops.
-      await validateScriptFileForShellBleed({ command: params.command, workdir });
+      await validateScriptFileForShellBleed({ command, workdir });
 
       const run = await runExecProcess({
-        command: params.command,
+        command,
         execCommand: execCommandOverride,
         workdir,
         env,

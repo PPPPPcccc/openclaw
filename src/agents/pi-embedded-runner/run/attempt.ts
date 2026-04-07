@@ -1,7 +1,9 @@
+import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import type { AgentMessage, StreamFn } from "@mariozechner/pi-agent-core";
 import { streamSimple } from "@mariozechner/pi-ai";
+import { trace } from "@opentelemetry/api";
 import {
   createAgentSession,
   DefaultResourceLoader,
@@ -1303,6 +1305,38 @@ export function buildAfterTurnRuntimeContext(params: {
   };
 }
 
+function deriveIstioTraceIdFromRunId(runId: string): string {
+  const normalized = runId.trim().toLowerCase();
+  if (/^[0-9a-f]{32}$/.test(normalized)) {
+    return normalized;
+  }
+  const source = runId.trim().length > 0 ? runId : "openclaw-run";
+  return crypto.createHash("sha256").update(source).digest("hex").slice(0, 32);
+}
+
+function deriveRootSpanIdFromRunId(runId: string): string {
+  return crypto.createHash("sha256").update(`${runId}:root`).digest("hex").slice(0, 16);
+}
+
+function isValidTraceId(value?: string): value is string {
+  return Boolean(value && /^[0-9a-f]{32}$/.test(value) && value !== "00000000000000000000000000000000");
+}
+
+function isValidSpanId(value?: string): value is string {
+  return Boolean(value && /^[0-9a-f]{16}$/.test(value) && value !== "0000000000000000");
+}
+
+function buildB3Headers(traceId: string, parentSpanId?: string): Record<string, string> {
+  const spanId = parentSpanId ?? crypto.randomBytes(8).toString("hex");
+  const headers: Record<string, string> = {
+    "x-b3-traceid": traceId,
+    "x-b3-spanid": spanId,
+    "x-b3-sampled": "1",
+    traceparent: `00-${traceId}-${spanId}-01`,
+  };
+  return headers;
+}
+
 function summarizeMessagePayload(msg: AgentMessage): { textChars: number; imageBlocks: number } {
   const content = (msg as { content?: unknown }).content;
   if (typeof content === "string") {
@@ -1380,6 +1414,22 @@ export async function runEmbeddedAttempt(
   log.debug(
     `embedded run start: runId=${params.runId} sessionId=${params.sessionId} provider=${params.provider} model=${params.modelId} thinking=${params.thinkLevel} messageChannel=${params.messageChannel ?? params.messageProvider ?? "unknown"}`,
   );
+  const tracer = trace.getTracer("openclaw");
+  const runRootSpan = tracer.startSpan("openclaw.run.root", {
+    attributes: {
+      "openclaw.run_id": params.runId,
+      "openclaw.session_id": params.sessionId,
+      "openclaw.provider": params.provider,
+      "openclaw.model_id": params.modelId,
+    },
+  });
+  const runRootSpanContext = runRootSpan.spanContext();
+  const fixedIstioTraceId = isValidTraceId(runRootSpanContext.traceId)
+    ? runRootSpanContext.traceId
+    : deriveIstioTraceIdFromRunId(params.runId);
+  const rootSpanId = isValidSpanId(runRootSpanContext.spanId)
+    ? runRootSpanContext.spanId
+    : deriveRootSpanIdFromRunId(params.runId);
 
   await fs.mkdir(resolvedWorkspace, { recursive: true });
 
@@ -1482,6 +1532,8 @@ export async function runEmbeddedAttempt(
           exec: {
             ...params.execOverrides,
             elevated: params.bashElevated,
+            b3TraceId: fixedIstioTraceId,
+            b3ParentSpanId: rootSpanId,
           },
           sandbox,
           messageProvider: params.messageChannel ?? params.messageProvider,
@@ -1937,6 +1989,18 @@ export async function runEmbeddedAttempt(
         params.thinkLevel,
         sessionAgentId,
       );
+      // Force one business-level trace id for all model calls in this run.
+      const fixedTraceInner = activeSession.agent.streamFn;
+      activeSession.agent.streamFn = (model, context, options) => {
+        const mergedHeaders = {
+          ...((options?.headers as Record<string, string> | undefined) ?? {}),
+          ...buildB3Headers(fixedIstioTraceId, rootSpanId),
+        };
+        return fixedTraceInner(model, context, {
+          ...options,
+          headers: mergedHeaders,
+        });
+      };
 
       if (cacheTrace) {
         cacheTrace.recordStage("session:loaded", {
@@ -2807,6 +2871,7 @@ export async function runEmbeddedAttempt(
       await sessionLock.release();
     }
   } finally {
+    runRootSpan.end();
     restoreSkillEnv?.();
     process.chdir(prevCwd);
   }

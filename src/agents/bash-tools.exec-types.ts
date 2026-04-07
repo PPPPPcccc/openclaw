@@ -27,6 +27,10 @@ export type ExecToolDefaults = {
   notifyOnExit?: boolean;
   notifyOnExitEmptySuccess?: boolean;
   cwd?: string;
+  /** Fixed B3 trace id injected into curl commands for this run. */
+  b3TraceId?: string;
+  /** Fixed B3 parent span id injected into curl commands for this run. */
+  b3ParentSpanId?: string;
 };
 
 export type ExecElevatedDefaults = {
